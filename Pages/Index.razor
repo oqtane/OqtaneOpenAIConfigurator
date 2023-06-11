@@ -1,0 +1,239 @@
+﻿@page "/"
+@using OpenAI;
+@using OpenAI.Chat;
+@using OpenAI.Models;
+@using Newtonsoft.Json;
+@inject IConfiguration _configuration
+@inject NotificationService NotificationService
+@inject Blazored.LocalStorage.ILocalStorageService localStorage
+@inject IJSRuntime _jsRuntime
+<PageTitle>Index</PageTitle>
+<RadzenRow class="rz-text-align-left" Gap="1rem">
+    <RadzenColumn Size="12">
+        @if (InProgress)
+        {
+            <RadzenProgressBar Value="100"
+                           ShowValue="false"
+                           Mode="ProgressBarMode.Indeterminate" />
+        }
+        else
+        {
+            <RadzenSpeechToTextButton Change="@(args => OnSpeechCaptured(args))" />
+            <RadzenButton Click=@CallService
+                      Text="Create Tree"
+                      ButtonStyle="ButtonStyle.Success" />
+            <RadzenTextArea @bind-Value=@InputText Rows="4"
+                            class="w-100" Style="margin-top:15px" />
+        }
+    </RadzenColumn>
+</RadzenRow>
+<RadzenRow class="rz-text-align-center" Gap="1rem">
+    <RadzenColumn Size="12">
+        <RadzenTextArea @bind-Value=@InputJSON Rows="25"
+                        class="w-100" Style="margin-top:15px" />
+    </RadzenColumn>   
+</RadzenRow>
+@code {
+    string Organization = "";
+    string ApiKey = "";
+
+    bool InProgress = false;
+    string InputText = "";
+    string InputJSON = "";
+
+    // This method initializes the component
+    protected override void OnInitialized()
+    {
+        // Get the organization from the configuration,
+        // default to an empty string if not found
+        Organization =
+        _configuration["OpenAIServiceOptions:Organization"] ?? "";
+
+        // Get the API key from the configuration,
+        // default to an empty string if not found
+        ApiKey =
+        _configuration["OpenAIServiceOptions:ApiKey"] ?? "";
+    }
+
+    // This method is called after the component is rendered
+    protected override async Task OnAfterRenderAsync(bool firstRender)
+    {
+        // Check if it's the first render of the component
+        if (firstRender)
+        {
+            // Get the JSON text from local storage
+            InputJSON =
+            await localStorage.GetItemAsync<string>("InputJSON");
+
+            // Notify the framework that the state has changed
+            // and the UI should be updated
+            StateHasChanged();
+        }
+    }
+
+    // This method is called when speech is captured
+    void OnSpeechCaptured(string speechValue)
+    {
+        // Append the captured speech value to the input text
+        InputText += speechValue;
+    }
+
+    public string GetInstruction()
+    {
+        string instruction = @"
+    You are a helpful assistant that creates json output from a text prompt.
+    When you have valid json you will only respond with json code nothing else.
+    You will ignore any input that cannot fit the defined json format.
+    The data in the json file will be used to construct module definitions.
+    The json format is as follows:
+    [ /* always output an array */
+    {
+      ""ModuleDefinitionName"": """" /* The types of Modules that the site has - must be from this list use the system name for the following descriptions */,
+      ""Title"": """" /* Module title */,
+      ""Pane"": ""DefaultPane"" /* Must be from a list of possible panes DefaultPane,Top,Right,Center,Header,footer */,
+      ""Order"": 1 /* must not duplicate starting with 1 */,
+      ""IsDeleted"": false /* Indicates if the module is removed */,
+      ""PermissionList"": [
+        {
+          ""PermissionName"": ""View"" /* must be either View or Edit */,
+          ""RoleName"": ""All Users"" /* Must be from a list of possible roles: All Users, Administrators, Registered Users, Host Users */
+        }
+      ]
+    }
+    ]
+
+    ##Example
+
+    #Prompt: create a module with title My Module in pane Top with order 1, with permissions View for All Users
+
+    #Response:
+    [{
+        ""ModuleDefinitionName"": ""My Module"",
+        ""Title"": ""My Module"",
+        ""Pane"": ""Top"",
+        ""Order"": 1,
+        ""IsDeleted"": false,
+        ""PermissionList"": [
+            {
+                ""PermissionName"": ""View"",
+                ""RoleName"": ""All Users""
+            }
+        ]
+    }]
+    ";
+
+        return instruction;
+    }
+
+
+    // This method calls the GPT-4 service
+    async Task CallService()
+    {
+        // Set the in-progress flag to true
+        InProgress = true;
+
+        // Notify the framework that the state has changed and the UI should be updated
+        StateHasChanged();
+
+        try
+        {
+            // Create a new instance of OpenAIClient using the ApiKey and Organization
+            var api = new OpenAIClient(new OpenAIAuthentication(ApiKey, Organization));
+
+            // Create a new list of chatMessages objects
+            var chatMessages = new List<Message>();
+            chatMessages.Add(new Message(Role.System, GetInstruction()));
+
+            // Set FinalInputText
+            string FinalInputText = InputText;
+
+            // Add existing JSON
+            if (InputJSON != null)
+            {
+                FinalInputText =
+                $"Start with the following json: {InputJSON} {InputText}";
+            }
+            else
+            {
+                FinalInputText =
+                $"Start with the following json: [] {InputText}";
+            }
+
+            chatMessages.Add(new Message(Role.User, FinalInputText));
+
+            // Call ChatGPT
+            // Create a new ChatRequest object with the chat prompts and pass
+            // it to the API's GetCompletionAsync method
+            // API Access to GPT4 is required for this call to work
+            // temperature is set to 0.0, which controls the randomness
+            // Lower values produce more deterministic outputs.
+
+            var chatRequest = new ChatRequest(
+                chatMessages,
+                temperature: 0.0,
+                topP: 1,
+                frequencyPenalty: 0,
+                presencePenalty: 0,
+                model: Model.GPT3_5_Turbo);
+
+            var result = await api.ChatEndpoint.GetCompletionAsync(chatRequest);
+
+            // Save the first choice result as a JSON file
+            InputJSON = result.FirstChoice;
+
+            // Check if the first character is '['
+            // This ensures the response is only JSON
+            if (!InputJSON.StartsWith("["))
+            {
+                // Set BadResponse
+                string BadResponse = InputJSON;
+
+                // Get the Previous JSON text from local storage
+                InputJSON =
+                await localStorage.GetItemAsync<string>("InputJSON");
+
+                // Create an error notification message
+                // Show the BadResponse
+                var Notification = new NotificationMessage()
+                    {
+                        Severity = NotificationSeverity.Error,
+                        Summary = "Error",
+                        Detail = BadResponse,
+                        Duration = 50000
+                    };
+
+                // Show the notification
+                NotificationService.Notify(Notification);
+            }
+            else
+            {
+                // Save the input text to local storage
+                await localStorage.SetItemAsync("InputJSON", InputJSON);
+
+                // Clear InputText
+                InputText = "";
+            }
+        }
+        catch (Exception ex)
+        {
+            // Create an error notification message
+            var Notification = new NotificationMessage()
+                {
+                    Severity = NotificationSeverity.Error,
+                    Summary = "Error",
+                    Detail = ex.Message,
+                    Duration = 40000
+                };
+
+            // Show the notification
+            NotificationService.Notify(Notification);
+        }
+
+        // Set the in-progress flag to false
+        InProgress = false;
+
+        // Notify the framework that the state has changed
+        // and the UI should be updated
+        StateHasChanged();
+    }   
+}
